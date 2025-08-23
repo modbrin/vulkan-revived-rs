@@ -92,8 +92,9 @@ impl OrderedDestroy for VulkanState {
 }
 
 struct SwapchainState {
+    instance: Arc<vkb::Instance>,
+    device: Arc<vkb::Device>,
     surface_format: vk::Format,
-    bld: vkb::SwapchainBuilder,
     swapchain: vkb::Swapchain,
     images: Vec<vk::Image>,
     image_views: Vec<vk::ImageView>,
@@ -106,27 +107,41 @@ impl SwapchainState {
         size: vk::Extent2D,
     ) -> Result<Self, anyhow::Error> {
         let surface_format = vk::Format::B8G8R8A8_SRGB;
-        let (bld, swapchain) = Self::create_swapchain(instance, device, surface_format, size)?;
+        let swapchain =
+            Self::create_swapchain(instance.clone(), device.clone(), surface_format, size)?;
         let images = swapchain.get_images()?;
         let image_views = swapchain.get_image_views()?;
 
         Ok(Self {
+            instance,
+            device,
             surface_format,
-            bld,
             swapchain,
             images,
             image_views,
         })
     }
 
-    fn resize_swapchain(&mut self, size: vk::Extent2D) {}
+    fn resize_swapchain(&mut self, size: vk::Extent2D) -> Result<(), anyhow::Error> {
+        self.destroy();
+
+        self.swapchain = Self::create_swapchain(
+            self.instance.clone(),
+            self.device.clone(),
+            self.surface_format,
+            size,
+        )?;
+        self.images = self.swapchain.get_images()?;
+        self.image_views = self.swapchain.get_image_views()?;
+        Ok(())
+    }
 
     fn create_swapchain(
         instance: Arc<vkb::Instance>,
         device: Arc<vkb::Device>,
         surface_format: vk::Format,
         size: vk::Extent2D,
-    ) -> Result<(vkb::SwapchainBuilder, vkb::Swapchain), anyhow::Error> {
+    ) -> Result<vkb::Swapchain, anyhow::Error> {
         let mut format = vk::SurfaceFormat2KHR::default();
         format.surface_format.color_space = vk::ColorSpaceKHR::SRGB_NONLINEAR;
         format.surface_format.format = surface_format;
@@ -136,8 +151,7 @@ impl SwapchainState {
             .desired_present_mode(vk::PresentModeKHR::FIFO)
             .desired_size(size)
             .add_image_usage_flags(vk::ImageUsageFlags::TRANSFER_DST);
-        let swapchain = builder.build()?;
-        Ok((builder, swapchain))
+        Ok(builder.build()?)
     }
 }
 
