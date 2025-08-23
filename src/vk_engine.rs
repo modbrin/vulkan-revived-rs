@@ -10,6 +10,8 @@ use sdl3::video::Window as SdlWindow;
 use sdl3::{Sdl, VideoSubsystem as SdlVideo};
 use {ash_bootstrap as vkb, vk_mem as vma};
 
+use crate::vk_initializers as vkinit;
+
 trait OrderedDestroy {
     fn destroy(&mut self);
 }
@@ -96,8 +98,10 @@ struct SwapchainState {
     device: Arc<vkb::Device>,
     surface_format: vk::Format,
     swapchain: vkb::Swapchain,
+    // secondary data
     images: Vec<vk::Image>,
     image_views: Vec<vk::ImageView>,
+    ready_to_present_semaphores: Vec<vk::Semaphore>,
 }
 
 impl SwapchainState {
@@ -109,17 +113,18 @@ impl SwapchainState {
         let surface_format = vk::Format::B8G8R8A8_SRGB;
         let swapchain =
             Self::create_swapchain(instance.clone(), device.clone(), surface_format, size)?;
-        let images = swapchain.get_images()?;
-        let image_views = swapchain.get_image_views()?;
-
-        Ok(Self {
+        let mut init = Self {
             instance,
             device,
             surface_format,
             swapchain,
-            images,
-            image_views,
-        })
+            images: Vec::new(),
+            image_views: Vec::new(),
+            ready_to_present_semaphores: Vec::new(),
+        };
+        init.recreate_images()?;
+        init.recreate_semaphores()?;
+        Ok(init)
     }
 
     fn resize_swapchain(&mut self, size: vk::Extent2D) -> Result<(), anyhow::Error> {
@@ -131,9 +136,37 @@ impl SwapchainState {
             self.surface_format,
             size,
         )?;
+        self.recreate_images()?;
+        self.recreate_semaphores()?;
+        Ok(())
+    }
+
+    fn recreate_images(&mut self) -> Result<(), anyhow::Error> {
         self.images = self.swapchain.get_images()?;
         self.image_views = self.swapchain.get_image_views()?;
         Ok(())
+    }
+
+    fn recreate_semaphores(&mut self) -> Result<(), anyhow::Error> {
+        let mut semaphores = Vec::new();
+        for _ in 0..self.images.len() {
+            unsafe {
+                semaphores.push(
+                    self.device
+                        .create_semaphore(&vkinit::semaphore_create_info(None), None)?,
+                );
+            }
+        }
+        self.ready_to_present_semaphores = semaphores;
+        Ok(())
+    }
+
+    fn destroy_semaphores(&mut self) {
+        for sem in self.ready_to_present_semaphores.drain(..) {
+            unsafe {
+                self.device.destroy_semaphore(sem, None);
+            }
+        }
     }
 
     fn create_swapchain(
@@ -151,14 +184,19 @@ impl SwapchainState {
             .desired_present_mode(vk::PresentModeKHR::FIFO)
             .desired_size(size)
             .add_image_usage_flags(vk::ImageUsageFlags::TRANSFER_DST);
+
         Ok(builder.build()?)
     }
 }
 
 impl OrderedDestroy for SwapchainState {
     fn destroy(&mut self) {
+        self.destroy_semaphores();
         self.swapchain.destroy_image_views().unwrap();
         self.swapchain.destroy();
+
+        self.image_views.clear();
+        self.images.clear();
     }
 }
 
