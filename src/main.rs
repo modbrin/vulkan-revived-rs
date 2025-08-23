@@ -1,7 +1,10 @@
-use crate::engine::VulkanEngine;
+use crate::vk_engine::VulkanEngine;
 
-mod engine;
+mod vk_engine;
+mod vk_initializers;
 
 fn main() {
+    tracing_subscriber::fmt::init();
+
     VulkanEngine::init().unwrap().run().unwrap();
 }
