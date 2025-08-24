@@ -1,6 +1,7 @@
+use std::ops::Deref;
 use std::sync::Arc;
-use std::thread;
 use std::time::Duration;
+use std::{slice, thread};
 
 use ash::vk;
 use raw_window_handle::{DisplayHandle, HasDisplayHandle, HasWindowHandle, WindowHandle};
@@ -10,11 +11,9 @@ use sdl3::video::Window as SdlWindow;
 use sdl3::{Sdl, VideoSubsystem as SdlVideo};
 use {ash_bootstrap as vkb, vk_mem as vma};
 
-use crate::vk_initializers as vkinit;
+use crate::{vk_image as vkimg, vk_initializers as vkinit};
 
-trait OrderedDestroy {
-    fn destroy(&mut self);
-}
+const NANOS_IN_SECOND: u64 = 1_000_000_000;
 
 struct AppState {
     frame_number: usize,
@@ -38,7 +37,7 @@ pub struct VulkanState {
     instance: Arc<vkb::Instance>,
     device: Arc<vkb::Device>,
     graphics_queue: vk::Queue,
-    graphics_queue_index: usize,
+    graphics_queue_index: u32,
     alloc: vma::Allocator,
 }
 
@@ -80,16 +79,83 @@ impl VulkanState {
             instance,
             device,
             graphics_queue,
-            graphics_queue_index,
+            graphics_queue_index: graphics_queue_index as u32,
             alloc,
         })
     }
-}
 
-impl OrderedDestroy for VulkanState {
     fn destroy(&mut self) {
         self.device.destroy();
         self.instance.destroy();
+    }
+}
+
+const FRAME_OVERLAP: usize = 2;
+
+#[derive(Debug)]
+struct FrameData {
+    command_pool: vk::CommandPool,
+    main_command_buffer: vk::CommandBuffer,
+    image_acquried_semaphore: vk::Semaphore,
+    frame_fence: vk::Fence,
+}
+
+#[derive(Debug)]
+struct FramesState([FrameData; FRAME_OVERLAP]);
+
+impl AsRef<[FrameData]> for FramesState {
+    fn as_ref(&self) -> &[FrameData] {
+        &self.0
+    }
+}
+
+impl Deref for FramesState {
+    type Target = [FrameData];
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl FramesState {
+    fn new(vulkan: &VulkanState) -> Result<Self, anyhow::Error> {
+        let mut frames = Vec::new();
+        let cmd_pool_info = vkinit::command_pool_create_info(
+            vulkan.graphics_queue_index,
+            vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER,
+        );
+        let fence_info = vkinit::fence_create_info(vk::FenceCreateFlags::SIGNALED);
+        let semaphore_info = vkinit::semaphore_create_info(None);
+        for _ in 0..FRAME_OVERLAP {
+            let command_pool = unsafe { vulkan.device.create_command_pool(&cmd_pool_info, None)? };
+            let cmd_buffer_info = vkinit::command_buffer_allocate_info(command_pool, 1);
+            let command_buffer =
+                unsafe { vulkan.device.allocate_command_buffers(&cmd_buffer_info)? };
+            let fence = unsafe { vulkan.device.create_fence(&fence_info, None)? };
+            let semaphore = unsafe { vulkan.device.create_semaphore(&semaphore_info, None)? };
+
+            frames.push(FrameData {
+                command_pool,
+                main_command_buffer: command_buffer
+                    .into_iter()
+                    .next()
+                    .expect("allocated exactly 1"),
+                frame_fence: fence,
+                image_acquried_semaphore: semaphore,
+            });
+        }
+        Ok(Self(
+            frames.try_into().expect("size defined by FRAME_OVERLAP"),
+        ))
+    }
+
+    fn destroy(&mut self, device: &ash::Device) {
+        for frame in &self.0 {
+            unsafe {
+                device.destroy_command_pool(frame.command_pool, None);
+                device.destroy_fence(frame.frame_fence, None);
+                device.destroy_semaphore(frame.image_acquried_semaphore, None);
+            }
+        }
     }
 }
 
@@ -187,9 +253,7 @@ impl SwapchainState {
 
         Ok(builder.build()?)
     }
-}
 
-impl OrderedDestroy for SwapchainState {
     fn destroy(&mut self) {
         self.destroy_semaphores();
         self.swapchain.destroy_image_views().unwrap();
@@ -226,8 +290,9 @@ impl SdlContext {
 pub struct VulkanEngine {
     app: AppState,
     sdl: SdlContext,
-    vulkan: VulkanState,
-    swapchain: SwapchainState,
+    vulkan_state: VulkanState,
+    swapchain_state: SwapchainState,
+    frames: FramesState,
 }
 
 impl VulkanEngine {
@@ -242,11 +307,13 @@ impl VulkanEngine {
         let display_hnd = sdl.window.display_handle().map_err(anyhow::Error::msg)?;
         let vulkan = VulkanState::new(window_hnd, display_hnd)?;
         let swapchain = SwapchainState::new(vulkan.instance.clone(), vulkan.device.clone(), size)?;
+        let frames = FramesState::new(&vulkan)?;
         Ok(Self {
             app,
             sdl,
-            vulkan,
-            swapchain,
+            vulkan_state: vulkan,
+            swapchain_state: swapchain,
+            frames,
         })
     }
 
@@ -254,7 +321,7 @@ impl VulkanEngine {
         let mut event_pump = self.sdl.handle.event_pump()?;
 
         let mut quit = false;
-        loop {
+        while !quit {
             for event in event_pump.poll_iter() {
                 match event {
                     SdlEvent::Quit { .. } => {
@@ -279,23 +346,111 @@ impl VulkanEngine {
                 thread::sleep(Duration::from_millis(100));
             }
 
-            if quit {
-                break;
-            }
+            self.draw()?;
         }
 
         Ok(())
     }
-}
 
-impl OrderedDestroy for VulkanEngine {
-    fn destroy(&mut self) {
+    fn current_frame(&self) -> &FrameData {
+        &self.frames[self.app.frame_number % FRAME_OVERLAP]
+    }
+
+    fn draw(&mut self) -> Result<(), anyhow::Error> {
+        let frame = self.current_frame();
+        let frame_fence = frame.frame_fence;
+        let image_acquired_semaphore = frame.image_acquried_semaphore;
+        let cmd = frame.main_command_buffer;
+        let vk_device = self.vulkan_state.device.deref();
+        let sc_device = self.swapchain_state.swapchain.deref();
+        let swapchain = self.swapchain_state.swapchain.as_ref();
+        let queue = self.vulkan_state.graphics_queue;
+
+        unsafe { vk_device.wait_for_fences(slice::from_ref(&frame_fence), true, NANOS_IN_SECOND)? };
+        unsafe { vk_device.reset_fences(slice::from_ref(&frame_fence))? };
+
+        let (swapchain_image_index, needs_resize) = unsafe {
+            sc_device.acquire_next_image(
+                *swapchain,
+                NANOS_IN_SECOND,
+                image_acquired_semaphore,
+                vk::Fence::null(),
+            )?
+        };
+        unsafe { vk_device.reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty())? };
+
+        let cmd_begin_info =
+            vkinit::command_buffer_begin_info(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+        unsafe { vk_device.begin_command_buffer(cmd, &cmd_begin_info)? };
+
+        let swapchain_img = self.swapchain_state.images[swapchain_image_index as usize];
+        vkimg::transition_image(
+            vk_device,
+            cmd,
+            swapchain_img,
+            vk::ImageLayout::UNDEFINED,
+            vk::ImageLayout::GENERAL,
+        );
+
+        let flash = (self.app.frame_number as f32 / 120.0).sin().abs();
+        let clear_value = vk::ClearColorValue {
+            float32: [0.0, 0.0, flash, 1.0],
+        };
+        let clear_range = vkinit::image_subresource_range(vk::ImageAspectFlags::COLOR);
         unsafe {
-            self.vulkan.device.device_wait_idle().unwrap();
+            vk_device.cmd_clear_color_image(
+                cmd,
+                swapchain_img,
+                vk::ImageLayout::GENERAL,
+                &clear_value,
+                slice::from_ref(&clear_range),
+            );
+        }
+        vkimg::transition_image(
+            vk_device,
+            cmd,
+            swapchain_img,
+            vk::ImageLayout::GENERAL,
+            vk::ImageLayout::PRESENT_SRC_KHR,
+        );
+        unsafe {
+            vk_device.end_command_buffer(cmd)?;
         }
 
-        self.swapchain.destroy();
-        self.vulkan.destroy();
+        let ready_to_present_semaphore =
+            self.swapchain_state.ready_to_present_semaphores[swapchain_image_index as usize];
+        let cmd_info = vkinit::command_buffer_submit_info(cmd);
+        let signal_info = vkinit::semaphore_submit_info(
+            vk::PipelineStageFlags2::ALL_GRAPHICS,
+            ready_to_present_semaphore,
+        );
+        let wait_info = vkinit::semaphore_submit_info(
+            vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT_KHR,
+            image_acquired_semaphore,
+        );
+        let submit_info = vkinit::submit_info(&cmd_info, &signal_info, &wait_info);
+
+        unsafe { vk_device.queue_submit2(queue, slice::from_ref(&submit_info), frame_fence)? };
+
+        let present_info = vkinit::present_info()
+            .swapchains(slice::from_ref(swapchain))
+            .wait_semaphores(slice::from_ref(&ready_to_present_semaphore))
+            .image_indices(slice::from_ref(&swapchain_image_index));
+        let needs_resize = unsafe { sc_device.queue_present(queue, &present_info)? };
+
+        self.app.frame_number += 1;
+
+        Ok(())
+    }
+
+    fn destroy(&mut self) {
+        unsafe {
+            self.vulkan_state.device.device_wait_idle().unwrap();
+        }
+
+        self.frames.destroy(&self.vulkan_state.device);
+        self.swapchain_state.destroy();
+        self.vulkan_state.destroy();
     }
 }
 
