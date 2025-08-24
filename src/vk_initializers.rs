@@ -91,3 +91,38 @@ pub fn submit_info<'a>(
 pub fn present_info<'a>() -> vk::PresentInfoKHR<'a> {
     vk::PresentInfoKHR::default()
 }
+
+pub fn image_create_info<'a>(
+    format: vk::Format,
+    usage: vk::ImageUsageFlags,
+    extent: vk::Extent3D,
+) -> vk::ImageCreateInfo<'a> {
+    vk::ImageCreateInfo::default()
+        .image_type(vk::ImageType::TYPE_2D)
+        .format(format)
+        .usage(usage)
+        .extent(extent)
+        .mip_levels(1)
+        .array_layers(1)
+        .samples(vk::SampleCountFlags::TYPE_1)
+        .tiling(vk::ImageTiling::OPTIMAL)
+}
+
+pub fn image_view_create_info<'a>(
+    format: vk::Format,
+    image: vk::Image,
+    aspect_mask: vk::ImageAspectFlags,
+) -> vk::ImageViewCreateInfo<'a> {
+    vk::ImageViewCreateInfo::default()
+        .format(format)
+        .image(image)
+        .view_type(vk::ImageViewType::TYPE_2D)
+        .subresource_range(
+            vk::ImageSubresourceRange::default()
+                .base_mip_level(0)
+                .level_count(1)
+                .base_array_layer(0)
+                .layer_count(1)
+                .aspect_mask(aspect_mask),
+        )
+}

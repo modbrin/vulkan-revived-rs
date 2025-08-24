@@ -1,4 +1,6 @@
-use std::ops::Deref;
+use std::collections::VecDeque;
+use std::fmt::{Debug, Formatter};
+use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
 use std::time::Duration;
 use std::{slice, thread};
@@ -9,8 +11,10 @@ use sdl3::event::{Event as SdlEvent, WindowEvent as SdlWindowEvent};
 use sdl3::keyboard::Keycode;
 use sdl3::video::Window as SdlWindow;
 use sdl3::{Sdl, VideoSubsystem as SdlVideo};
+use vk_mem::Alloc;
 use {ash_bootstrap as vkb, vk_mem as vma};
 
+use crate::vk_types::AllocatedImage;
 use crate::{vk_image as vkimg, vk_initializers as vkinit};
 
 const NANOS_IN_SECOND: u64 = 1_000_000_000;
@@ -38,7 +42,7 @@ pub struct VulkanState {
     device: Arc<vkb::Device>,
     graphics_queue: vk::Queue,
     graphics_queue_index: u32,
-    alloc: vma::Allocator,
+    alloc: Option<vma::Allocator>,
 }
 
 impl VulkanState {
@@ -80,11 +84,16 @@ impl VulkanState {
             device,
             graphics_queue,
             graphics_queue_index: graphics_queue_index as u32,
-            alloc,
+            alloc: Some(alloc),
         })
     }
 
+    fn alloc(&self) -> &vma::Allocator {
+        self.alloc.as_ref().unwrap()
+    }
+
     fn destroy(&mut self) {
+        self.alloc.take();
         self.device.destroy();
         self.instance.destroy();
     }
@@ -98,6 +107,7 @@ struct FrameData {
     main_command_buffer: vk::CommandBuffer,
     image_acquried_semaphore: vk::Semaphore,
     frame_fence: vk::Fence,
+    del_queue: DeletionQueue,
 }
 
 #[derive(Debug)]
@@ -113,6 +123,12 @@ impl Deref for FramesState {
     type Target = [FrameData];
     fn deref(&self) -> &Self::Target {
         &self.0
+    }
+}
+
+impl DerefMut for FramesState {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
     }
 }
 
@@ -141,6 +157,7 @@ impl FramesState {
                     .expect("allocated exactly 1"),
                 frame_fence: fence,
                 image_acquried_semaphore: semaphore,
+                del_queue: DeletionQueue::new(),
             });
         }
         Ok(Self(
@@ -148,77 +165,150 @@ impl FramesState {
         ))
     }
 
-    fn destroy(&mut self, device: &ash::Device) {
-        for frame in &self.0 {
+    fn destroy(&mut self, vulkan_state: &VulkanState) {
+        for frame in &mut self.0 {
             unsafe {
-                device.destroy_command_pool(frame.command_pool, None);
-                device.destroy_fence(frame.frame_fence, None);
-                device.destroy_semaphore(frame.image_acquried_semaphore, None);
+                vulkan_state
+                    .device
+                    .destroy_command_pool(frame.command_pool, None);
+                vulkan_state.device.destroy_fence(frame.frame_fence, None);
+                vulkan_state
+                    .device
+                    .destroy_semaphore(frame.image_acquried_semaphore, None);
+                frame.del_queue.flush();
             }
         }
     }
 }
 
 struct SwapchainState {
-    instance: Arc<vkb::Instance>,
-    device: Arc<vkb::Device>,
     surface_format: vk::Format,
     swapchain: vkb::Swapchain,
     // secondary data
     images: Vec<vk::Image>,
     image_views: Vec<vk::ImageView>,
     ready_to_present_semaphores: Vec<vk::Semaphore>,
+    // separate draw image
+    draw_image: AllocatedImage,
 }
 
 impl SwapchainState {
-    fn new(
-        instance: Arc<vkb::Instance>,
-        device: Arc<vkb::Device>,
-        size: vk::Extent2D,
-    ) -> Result<Self, anyhow::Error> {
+    fn new(vk_state: &VulkanState, size: vk::Extent2D) -> Result<Self, anyhow::Error> {
+        let instance = vk_state.instance.clone();
+        let device = vk_state.device.clone();
+
+        let draw_image = Self::create_draw_image(vk_state, size)?;
+
         let surface_format = vk::Format::B8G8R8A8_SRGB;
-        let swapchain =
-            Self::create_swapchain(instance.clone(), device.clone(), surface_format, size)?;
+        let swapchain = Self::create_swapchain(instance, device, surface_format, size)?;
         let mut init = Self {
-            instance,
-            device,
             surface_format,
             swapchain,
             images: Vec::new(),
             image_views: Vec::new(),
             ready_to_present_semaphores: Vec::new(),
+            draw_image,
         };
-        init.recreate_images()?;
-        init.recreate_semaphores()?;
+        init.recreate_swapchain_images()?;
+        init.recreate_semaphores(vk_state)?;
+
         Ok(init)
     }
 
-    fn resize_swapchain(&mut self, size: vk::Extent2D) -> Result<(), anyhow::Error> {
-        self.destroy();
+    fn create_draw_image(
+        vulkan_state: &VulkanState,
+        size: vk::Extent2D,
+    ) -> Result<AllocatedImage, anyhow::Error> {
+        let draw_image_format = vk::Format::R16G16B16A16_SFLOAT;
+        let draw_image_usages = vk::ImageUsageFlags::TRANSFER_SRC
+            | vk::ImageUsageFlags::TRANSFER_DST
+            | vk::ImageUsageFlags::STORAGE
+            | vk::ImageUsageFlags::COLOR_ATTACHMENT;
+        let draw_image_extent = vk::Extent3D::default()
+            .width(size.width)
+            .height(size.height)
+            .depth(1);
 
-        self.swapchain = Self::create_swapchain(
-            self.instance.clone(),
-            self.device.clone(),
-            self.surface_format,
-            size,
-        )?;
-        self.recreate_images()?;
-        self.recreate_semaphores()?;
+        let img_create_info =
+            vkinit::image_create_info(draw_image_format, draw_image_usages, draw_image_extent);
+        let mut img_alloc_info = vma::AllocationCreateInfo::default();
+        img_alloc_info.usage = vma::MemoryUsage::AutoPreferDevice;
+        img_alloc_info.required_flags = vk::MemoryPropertyFlags::DEVICE_LOCAL;
+        let (image, allocation) = unsafe {
+            vulkan_state
+                .alloc()
+                .create_image(&img_create_info, &img_alloc_info)?
+        };
+
+        let imgview_create_info =
+            vkinit::image_view_create_info(draw_image_format, image, vk::ImageAspectFlags::COLOR);
+        let image_view = unsafe {
+            vulkan_state
+                .device
+                .create_image_view(&imgview_create_info, None)?
+        };
+
+        let draw_image = AllocatedImage {
+            image_extent: draw_image_extent,
+            image_format: draw_image_format,
+            image,
+            image_view,
+            allocation,
+        };
+        Ok(draw_image)
+    }
+
+    fn destroy_draw_image(&mut self, vulkan_state: &VulkanState) {
+        unsafe {
+            vulkan_state
+                .device
+                .destroy_image_view(self.draw_image.image_view, None)
+        };
+        unsafe {
+            vulkan_state
+                .alloc()
+                .destroy_image(self.draw_image.image, &mut self.draw_image.allocation)
+        };
+    }
+
+    fn resize_swapchain(
+        &mut self,
+        vk_state: &VulkanState,
+        new_size: vk::Extent2D,
+    ) -> Result<(), anyhow::Error> {
+        let instance = vk_state.instance.clone();
+        let device = vk_state.device.clone();
+
+        self.destroy_semaphores(vk_state);
+        self.destroy_swapchain();
+
+        self.swapchain = Self::create_swapchain(instance, device, self.surface_format, new_size)?;
+        self.recreate_swapchain_images()?;
+        self.recreate_semaphores(vk_state)?;
         Ok(())
     }
 
-    fn recreate_images(&mut self) -> Result<(), anyhow::Error> {
+    fn recreate_swapchain_images(&mut self) -> Result<(), anyhow::Error> {
         self.images = self.swapchain.get_images()?;
         self.image_views = self.swapchain.get_image_views()?;
         Ok(())
     }
 
-    fn recreate_semaphores(&mut self) -> Result<(), anyhow::Error> {
+    fn destroy_swapchain(&mut self) {
+        self.swapchain.destroy_image_views().unwrap();
+        self.swapchain.destroy();
+
+        self.image_views.clear();
+        self.images.clear();
+    }
+
+    fn recreate_semaphores(&mut self, vk_state: &VulkanState) -> Result<(), anyhow::Error> {
         let mut semaphores = Vec::new();
         for _ in 0..self.images.len() {
             unsafe {
                 semaphores.push(
-                    self.device
+                    vk_state
+                        .device
                         .create_semaphore(&vkinit::semaphore_create_info(None), None)?,
                 );
             }
@@ -227,10 +317,10 @@ impl SwapchainState {
         Ok(())
     }
 
-    fn destroy_semaphores(&mut self) {
+    fn destroy_semaphores(&mut self, vk_state: &VulkanState) {
         for sem in self.ready_to_present_semaphores.drain(..) {
             unsafe {
-                self.device.destroy_semaphore(sem, None);
+                vk_state.device.destroy_semaphore(sem, None);
             }
         }
     }
@@ -254,13 +344,10 @@ impl SwapchainState {
         Ok(builder.build()?)
     }
 
-    fn destroy(&mut self) {
-        self.destroy_semaphores();
-        self.swapchain.destroy_image_views().unwrap();
-        self.swapchain.destroy();
-
-        self.image_views.clear();
-        self.images.clear();
+    fn destroy(&mut self, vk_state: &VulkanState) {
+        self.destroy_draw_image(vk_state);
+        self.destroy_swapchain();
+        self.destroy_semaphores(vk_state);
     }
 }
 
@@ -287,12 +374,43 @@ impl SdlContext {
     }
 }
 
+struct DeletionQueue {
+    deletors: VecDeque<Box<dyn FnOnce()>>,
+}
+
+impl Debug for DeletionQueue {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        writeln!(
+            f,
+            "deletion queue with {} pending tasks",
+            self.deletors.len()
+        )
+    }
+}
+
+impl DeletionQueue {
+    fn new() -> Self {
+        Self {
+            deletors: VecDeque::new(),
+        }
+    }
+    fn push<F: FnOnce() + 'static>(&mut self, f: F) {
+        self.deletors.push_back(Box::new(f));
+    }
+    fn flush(&mut self) {
+        while let Some(f) = self.deletors.pop_back() {
+            f();
+        }
+    }
+}
+
 pub struct VulkanEngine {
     app: AppState,
     sdl: SdlContext,
     vulkan_state: VulkanState,
     swapchain_state: SwapchainState,
     frames: FramesState,
+    del_queue: DeletionQueue,
 }
 
 impl VulkanEngine {
@@ -306,14 +424,16 @@ impl VulkanEngine {
         let window_hnd = sdl.window.window_handle().map_err(anyhow::Error::msg)?;
         let display_hnd = sdl.window.display_handle().map_err(anyhow::Error::msg)?;
         let vulkan = VulkanState::new(window_hnd, display_hnd)?;
-        let swapchain = SwapchainState::new(vulkan.instance.clone(), vulkan.device.clone(), size)?;
+        let swapchain = SwapchainState::new(&vulkan, size)?;
         let frames = FramesState::new(&vulkan)?;
+        let del_queue = DeletionQueue::new();
         Ok(Self {
             app,
             sdl,
             vulkan_state: vulkan,
             swapchain_state: swapchain,
             frames,
+            del_queue,
         })
     }
 
@@ -344,6 +464,7 @@ impl VulkanEngine {
 
             if self.app.stop_rendering {
                 thread::sleep(Duration::from_millis(100));
+                continue;
             }
 
             self.draw()?;
@@ -352,69 +473,120 @@ impl VulkanEngine {
         Ok(())
     }
 
-    fn current_frame(&self) -> &FrameData {
-        &self.frames[self.app.frame_number % FRAME_OVERLAP]
+    fn current_frame_index(&self) -> usize {
+        self.app.frame_number % FRAME_OVERLAP
+    }
+
+    /// returns VulkanDevice
+    fn vk_device(&self) -> &vkb::Device {
+        self.vulkan_state.device.deref()
+    }
+
+    /// returns SwapchainDevice
+    fn sc_device(&self) -> &ash::khr::swapchain::Device {
+        self.swapchain_state.swapchain.deref()
+    }
+
+    /// returns SwapchainKHR
+    fn swapchain(&self) -> &vk::SwapchainKHR {
+        self.swapchain_state.swapchain.as_ref()
     }
 
     fn draw(&mut self) -> Result<(), anyhow::Error> {
-        let frame = self.current_frame();
+        let frame_index = self.current_frame_index();
+        let frame = &self.frames[frame_index];
         let frame_fence = frame.frame_fence;
         let image_acquired_semaphore = frame.image_acquried_semaphore;
         let cmd = frame.main_command_buffer;
-        let vk_device = self.vulkan_state.device.deref();
-        let sc_device = self.swapchain_state.swapchain.deref();
-        let swapchain = self.swapchain_state.swapchain.as_ref();
         let queue = self.vulkan_state.graphics_queue;
 
-        unsafe { vk_device.wait_for_fences(slice::from_ref(&frame_fence), true, NANOS_IN_SECOND)? };
-        unsafe { vk_device.reset_fences(slice::from_ref(&frame_fence))? };
+        unsafe {
+            self.vk_device().wait_for_fences(
+                slice::from_ref(&frame_fence),
+                true,
+                NANOS_IN_SECOND,
+            )?
+        };
+
+        self.frames[frame_index].del_queue.flush();
+
+        unsafe {
+            self.vk_device()
+                .reset_fences(slice::from_ref(&frame_fence))?
+        };
 
         let (swapchain_image_index, needs_resize) = unsafe {
-            sc_device.acquire_next_image(
-                *swapchain,
+            self.sc_device().acquire_next_image(
+                *self.swapchain(),
                 NANOS_IN_SECOND,
                 image_acquired_semaphore,
                 vk::Fence::null(),
             )?
         };
-        unsafe { vk_device.reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty())? };
+        if needs_resize {
+            self.app.resize_requested = true;
+            return Ok(());
+        }
+        unsafe {
+            self.vk_device()
+                .reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty())?
+        };
 
         let cmd_begin_info =
             vkinit::command_buffer_begin_info(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
-        unsafe { vk_device.begin_command_buffer(cmd, &cmd_begin_info)? };
+        unsafe {
+            self.vk_device()
+                .begin_command_buffer(cmd, &cmd_begin_info)?
+        };
 
-        let swapchain_img = self.swapchain_state.images[swapchain_image_index as usize];
+        let swapchain_image = self.swapchain_state.images[swapchain_image_index as usize];
+        let swapchain_image_extent = self.swapchain_state.swapchain.extent;
+        let draw_image = self.swapchain_state.draw_image.image;
+        let draw_image_extent = vk::Extent2D::default()
+            .width(self.swapchain_state.draw_image.image_extent.width)
+            .height(self.swapchain_state.draw_image.image_extent.height);
         vkimg::transition_image(
-            vk_device,
+            self.vk_device(),
             cmd,
-            swapchain_img,
+            draw_image,
             vk::ImageLayout::UNDEFINED,
             vk::ImageLayout::GENERAL,
         );
 
-        let flash = (self.app.frame_number as f32 / 120.0).sin().abs();
-        let clear_value = vk::ClearColorValue {
-            float32: [0.0, 0.0, flash, 1.0],
-        };
-        let clear_range = vkinit::image_subresource_range(vk::ImageAspectFlags::COLOR);
-        unsafe {
-            vk_device.cmd_clear_color_image(
-                cmd,
-                swapchain_img,
-                vk::ImageLayout::GENERAL,
-                &clear_value,
-                slice::from_ref(&clear_range),
-            );
-        }
+        self.draw_background(cmd)?;
+
         vkimg::transition_image(
-            vk_device,
+            self.vk_device(),
             cmd,
-            swapchain_img,
+            draw_image,
             vk::ImageLayout::GENERAL,
+            vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+        );
+        vkimg::transition_image(
+            self.vk_device(),
+            cmd,
+            swapchain_image,
+            vk::ImageLayout::UNDEFINED,
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+        );
+        vkimg::copy_image_to_image(
+            self.vk_device(),
+            cmd,
+            draw_image,
+            swapchain_image,
+            draw_image_extent,
+            swapchain_image_extent,
+        );
+        vkimg::transition_image(
+            self.vk_device(),
+            cmd,
+            swapchain_image,
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
             vk::ImageLayout::PRESENT_SRC_KHR,
         );
+
         unsafe {
-            vk_device.end_command_buffer(cmd)?;
+            self.vk_device().end_command_buffer(cmd)?;
         }
 
         let ready_to_present_semaphore =
@@ -430,16 +602,41 @@ impl VulkanEngine {
         );
         let submit_info = vkinit::submit_info(&cmd_info, &signal_info, &wait_info);
 
-        unsafe { vk_device.queue_submit2(queue, slice::from_ref(&submit_info), frame_fence)? };
+        unsafe {
+            self.vk_device()
+                .queue_submit2(queue, slice::from_ref(&submit_info), frame_fence)?
+        };
 
         let present_info = vkinit::present_info()
-            .swapchains(slice::from_ref(swapchain))
+            .swapchains(slice::from_ref(self.swapchain()))
             .wait_semaphores(slice::from_ref(&ready_to_present_semaphore))
             .image_indices(slice::from_ref(&swapchain_image_index));
-        let needs_resize = unsafe { sc_device.queue_present(queue, &present_info)? };
+        let needs_resize = unsafe { self.sc_device().queue_present(queue, &present_info)? };
+        if needs_resize {
+            self.app.resize_requested = true;
+            return Ok(());
+        }
 
         self.app.frame_number += 1;
 
+        Ok(())
+    }
+
+    fn draw_background(&mut self, cmd: vk::CommandBuffer) -> Result<(), anyhow::Error> {
+        let flash = (self.app.frame_number as f32 / 120.0).sin().abs();
+        let clear_value = vk::ClearColorValue {
+            float32: [0.0, 0.0, flash, 1.0],
+        };
+        let clear_range = vkinit::image_subresource_range(vk::ImageAspectFlags::COLOR);
+        unsafe {
+            self.vk_device().cmd_clear_color_image(
+                cmd,
+                self.swapchain_state.draw_image.image,
+                vk::ImageLayout::GENERAL,
+                &clear_value,
+                slice::from_ref(&clear_range),
+            );
+        }
         Ok(())
     }
 
@@ -448,8 +645,9 @@ impl VulkanEngine {
             self.vulkan_state.device.device_wait_idle().unwrap();
         }
 
-        self.frames.destroy(&self.vulkan_state.device);
-        self.swapchain_state.destroy();
+        self.del_queue.flush();
+        self.frames.destroy(&self.vulkan_state);
+        self.swapchain_state.destroy(&self.vulkan_state);
         self.vulkan_state.destroy();
     }
 }

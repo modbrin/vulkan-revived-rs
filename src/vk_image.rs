@@ -31,3 +31,51 @@ pub fn transition_image(
 
     unsafe { device.cmd_pipeline_barrier2(cmd, &dep_info) };
 }
+
+pub fn copy_image_to_image(
+    device: &ash::Device,
+    cmd: vk::CommandBuffer,
+    source: vk::Image,
+    destination: vk::Image,
+    src_size: vk::Extent2D,
+    dst_size: vk::Extent2D,
+) {
+    let image_blit = vk::ImageBlit2::default()
+        .src_offsets([
+            vk::Offset3D::default(),
+            vk::Offset3D::default()
+                .x(src_size.width as i32)
+                .y(src_size.height as i32)
+                .z(1),
+        ])
+        .dst_offsets([
+            vk::Offset3D::default(),
+            vk::Offset3D::default()
+                .x(dst_size.width as i32)
+                .y(dst_size.height as i32)
+                .z(1),
+        ])
+        .src_subresource(
+            vk::ImageSubresourceLayers::default()
+                .aspect_mask(vk::ImageAspectFlags::COLOR)
+                .base_array_layer(0)
+                .layer_count(1)
+                .mip_level(0),
+        )
+        .dst_subresource(
+            vk::ImageSubresourceLayers::default()
+                .aspect_mask(vk::ImageAspectFlags::COLOR)
+                .base_array_layer(0)
+                .layer_count(1)
+                .mip_level(0),
+        );
+    let blit_info = vk::BlitImageInfo2::default()
+        .src_image(source)
+        .src_image_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+        .dst_image(destination)
+        .dst_image_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+        .filter(vk::Filter::LINEAR)
+        .regions(slice::from_ref(&image_blit));
+
+    unsafe { device.cmd_blit_image2(cmd, &blit_info) };
+}
