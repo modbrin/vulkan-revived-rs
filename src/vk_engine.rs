@@ -187,10 +187,6 @@ impl Drop for FramesState {
 }
 
 struct SwapchainState {
-    instance: Arc<vkb::Instance>,
-    device: Arc<vkb::Device>,
-    alloc: Arc<vma::Allocator>,
-
     surface_format: vk::Format,
     swapchain: vkb::Swapchain,
     // secondary data
@@ -199,6 +195,11 @@ struct SwapchainState {
     ready_to_present_semaphores: Vec<vk::Semaphore>,
     // separate draw image
     draw_image: AllocatedImage,
+
+    // handles
+    alloc: Arc<vma::Allocator>,
+    device: Arc<vkb::Device>,
+    instance: Arc<vkb::Instance>,
 }
 
 impl SwapchainState {
@@ -359,9 +360,9 @@ impl Drop for SwapchainState {
 }
 
 pub struct SdlContext {
-    handle: Sdl,
-    video: SdlVideo,
     window: SdlWindow,
+    video: SdlVideo,
+    handle: Sdl,
 }
 
 impl SdlContext {
