@@ -37,12 +37,28 @@ impl AppState {
     }
 }
 
+pub struct VmaState {
+    alloc: Arc<vma::Allocator>,
+}
+
+impl VmaState {
+    fn new(instance: &vkb::Instance, device: &vkb::Device) -> Result<Self, anyhow::Error> {
+        let alloc = unsafe {
+            Arc::new(vma::Allocator::new(vma::AllocatorCreateInfo::new(
+                instance.as_ref(),
+                device,
+                device.physical_device().as_ref().clone(),
+            ))?)
+        };
+        Ok(Self { alloc })
+    }
+}
+
 pub struct VulkanState {
-    instance: Arc<vkb::Instance>,
     device: Arc<vkb::Device>,
+    instance: Arc<vkb::Instance>,
     graphics_queue: vk::Queue,
     graphics_queue_index: u32,
-    alloc: Option<vma::Allocator>,
 }
 
 impl VulkanState {
@@ -71,29 +87,17 @@ impl VulkanState {
         let device = Arc::new(vkb::DeviceBuilder::new(physical_device, instance.clone()).build()?);
         let (graphics_queue_index, graphics_queue) = device.get_queue(vkb::QueueType::Graphics)?;
 
-        let alloc = unsafe {
-            vma::Allocator::new(vma::AllocatorCreateInfo::new(
-                vkb::Instance::as_ref(&instance),
-                vkb::Device::as_ref(&device),
-                device.physical_device().as_ref().clone(),
-            ))?
-        };
-
         Ok(Self {
             instance,
             device,
             graphics_queue,
             graphics_queue_index: graphics_queue_index as u32,
-            alloc: Some(alloc),
         })
     }
+}
 
-    fn alloc(&self) -> &vma::Allocator {
-        self.alloc.as_ref().unwrap()
-    }
-
-    fn destroy(&mut self) {
-        self.alloc.take();
+impl Drop for VulkanState {
+    fn drop(&mut self) {
         self.device.destroy();
         self.instance.destroy();
     }
@@ -110,44 +114,45 @@ struct FrameData {
     del_queue: DeletionQueue,
 }
 
-#[derive(Debug)]
-struct FramesState([FrameData; FRAME_OVERLAP]);
+struct FramesState {
+    device: Arc<vkb::Device>,
+    frames: [FrameData; FRAME_OVERLAP],
+}
 
 impl AsRef<[FrameData]> for FramesState {
     fn as_ref(&self) -> &[FrameData] {
-        &self.0
+        &self.frames
     }
 }
 
 impl Deref for FramesState {
     type Target = [FrameData];
     fn deref(&self) -> &Self::Target {
-        &self.0
+        &self.frames
     }
 }
 
 impl DerefMut for FramesState {
     fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.0
+        &mut self.frames
     }
 }
 
 impl FramesState {
-    fn new(vulkan: &VulkanState) -> Result<Self, anyhow::Error> {
+    fn new(device: Arc<vkb::Device>, graphics_queue_index: u32) -> Result<Self, anyhow::Error> {
         let mut frames = Vec::new();
         let cmd_pool_info = vkinit::command_pool_create_info(
-            vulkan.graphics_queue_index,
+            graphics_queue_index,
             vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER,
         );
         let fence_info = vkinit::fence_create_info(vk::FenceCreateFlags::SIGNALED);
         let semaphore_info = vkinit::semaphore_create_info(None);
         for _ in 0..FRAME_OVERLAP {
-            let command_pool = unsafe { vulkan.device.create_command_pool(&cmd_pool_info, None)? };
+            let command_pool = unsafe { device.create_command_pool(&cmd_pool_info, None)? };
             let cmd_buffer_info = vkinit::command_buffer_allocate_info(command_pool, 1);
-            let command_buffer =
-                unsafe { vulkan.device.allocate_command_buffers(&cmd_buffer_info)? };
-            let fence = unsafe { vulkan.device.create_fence(&fence_info, None)? };
-            let semaphore = unsafe { vulkan.device.create_semaphore(&semaphore_info, None)? };
+            let command_buffer = unsafe { device.allocate_command_buffers(&cmd_buffer_info)? };
+            let fence = unsafe { device.create_fence(&fence_info, None)? };
+            let semaphore = unsafe { device.create_semaphore(&semaphore_info, None)? };
 
             frames.push(FrameData {
                 command_pool,
@@ -160,20 +165,20 @@ impl FramesState {
                 del_queue: DeletionQueue::new(),
             });
         }
-        Ok(Self(
-            frames.try_into().expect("size defined by FRAME_OVERLAP"),
-        ))
+        Ok(Self {
+            device,
+            frames: frames.try_into().expect("size defined by FRAME_OVERLAP"),
+        })
     }
+}
 
-    fn destroy(&mut self, vulkan_state: &VulkanState) {
-        for frame in &mut self.0 {
+impl Drop for FramesState {
+    fn drop(&mut self) {
+        for frame in &mut self.frames {
             unsafe {
-                vulkan_state
-                    .device
-                    .destroy_command_pool(frame.command_pool, None);
-                vulkan_state.device.destroy_fence(frame.frame_fence, None);
-                vulkan_state
-                    .device
+                self.device.destroy_command_pool(frame.command_pool, None);
+                self.device.destroy_fence(frame.frame_fence, None);
+                self.device
                     .destroy_semaphore(frame.image_acquried_semaphore, None);
                 frame.del_queue.flush();
             }
@@ -182,6 +187,10 @@ impl FramesState {
 }
 
 struct SwapchainState {
+    instance: Arc<vkb::Instance>,
+    device: Arc<vkb::Device>,
+    alloc: Arc<vma::Allocator>,
+
     surface_format: vk::Format,
     swapchain: vkb::Swapchain,
     // secondary data
@@ -193,15 +202,21 @@ struct SwapchainState {
 }
 
 impl SwapchainState {
-    fn new(vk_state: &VulkanState, size: vk::Extent2D) -> Result<Self, anyhow::Error> {
-        let instance = vk_state.instance.clone();
-        let device = vk_state.device.clone();
-
-        let draw_image = Self::create_draw_image(vk_state, size)?;
+    fn new(
+        instance: Arc<vkb::Instance>,
+        device: Arc<vkb::Device>,
+        alloc: Arc<vma::Allocator>,
+        size: vk::Extent2D,
+    ) -> Result<Self, anyhow::Error> {
+        let draw_image = Self::create_draw_image(&device, &alloc, size)?;
 
         let surface_format = vk::Format::B8G8R8A8_SRGB;
-        let swapchain = Self::create_swapchain(instance, device, surface_format, size)?;
+        let swapchain =
+            Self::create_swapchain(instance.clone(), device.clone(), surface_format, size)?;
         let mut init = Self {
+            instance,
+            device,
+            alloc,
             surface_format,
             swapchain,
             images: Vec::new(),
@@ -210,13 +225,14 @@ impl SwapchainState {
             draw_image,
         };
         init.recreate_swapchain_images()?;
-        init.recreate_semaphores(vk_state)?;
+        init.recreate_semaphores()?;
 
         Ok(init)
     }
 
     fn create_draw_image(
-        vulkan_state: &VulkanState,
+        device: &ash::Device,
+        alloc: &vma::Allocator,
         size: vk::Extent2D,
     ) -> Result<AllocatedImage, anyhow::Error> {
         let draw_image_format = vk::Format::R16G16B16A16_SFLOAT;
@@ -234,19 +250,11 @@ impl SwapchainState {
         let mut img_alloc_info = vma::AllocationCreateInfo::default();
         img_alloc_info.usage = vma::MemoryUsage::AutoPreferDevice;
         img_alloc_info.required_flags = vk::MemoryPropertyFlags::DEVICE_LOCAL;
-        let (image, allocation) = unsafe {
-            vulkan_state
-                .alloc()
-                .create_image(&img_create_info, &img_alloc_info)?
-        };
+        let (image, allocation) = unsafe { alloc.create_image(&img_create_info, &img_alloc_info)? };
 
         let imgview_create_info =
             vkinit::image_view_create_info(draw_image_format, image, vk::ImageAspectFlags::COLOR);
-        let image_view = unsafe {
-            vulkan_state
-                .device
-                .create_image_view(&imgview_create_info, None)?
-        };
+        let image_view = unsafe { device.create_image_view(&imgview_create_info, None)? };
 
         let draw_image = AllocatedImage {
             image_extent: draw_image_extent,
@@ -258,15 +266,13 @@ impl SwapchainState {
         Ok(draw_image)
     }
 
-    fn destroy_draw_image(&mut self, vulkan_state: &VulkanState) {
+    fn destroy_draw_image(&mut self) {
         unsafe {
-            vulkan_state
-                .device
+            self.device
                 .destroy_image_view(self.draw_image.image_view, None)
         };
         unsafe {
-            vulkan_state
-                .alloc()
+            self.alloc
                 .destroy_image(self.draw_image.image, &mut self.draw_image.allocation)
         };
     }
@@ -279,12 +285,12 @@ impl SwapchainState {
         let instance = vk_state.instance.clone();
         let device = vk_state.device.clone();
 
-        self.destroy_semaphores(vk_state);
+        self.destroy_semaphores();
         self.destroy_swapchain();
 
         self.swapchain = Self::create_swapchain(instance, device, self.surface_format, new_size)?;
         self.recreate_swapchain_images()?;
-        self.recreate_semaphores(vk_state)?;
+        self.recreate_semaphores()?;
         Ok(())
     }
 
@@ -302,13 +308,12 @@ impl SwapchainState {
         self.images.clear();
     }
 
-    fn recreate_semaphores(&mut self, vk_state: &VulkanState) -> Result<(), anyhow::Error> {
+    fn recreate_semaphores(&mut self) -> Result<(), anyhow::Error> {
         let mut semaphores = Vec::new();
         for _ in 0..self.images.len() {
             unsafe {
                 semaphores.push(
-                    vk_state
-                        .device
+                    self.device
                         .create_semaphore(&vkinit::semaphore_create_info(None), None)?,
                 );
             }
@@ -317,10 +322,10 @@ impl SwapchainState {
         Ok(())
     }
 
-    fn destroy_semaphores(&mut self, vk_state: &VulkanState) {
+    fn destroy_semaphores(&mut self) {
         for sem in self.ready_to_present_semaphores.drain(..) {
             unsafe {
-                vk_state.device.destroy_semaphore(sem, None);
+                self.device.destroy_semaphore(sem, None);
             }
         }
     }
@@ -343,11 +348,13 @@ impl SwapchainState {
 
         Ok(builder.build()?)
     }
+}
 
-    fn destroy(&mut self, vk_state: &VulkanState) {
-        self.destroy_draw_image(vk_state);
+impl Drop for SwapchainState {
+    fn drop(&mut self) {
+        self.destroy_draw_image();
         self.destroy_swapchain();
-        self.destroy_semaphores(vk_state);
+        self.destroy_semaphores();
     }
 }
 
@@ -404,13 +411,20 @@ impl DeletionQueue {
     }
 }
 
+impl Drop for DeletionQueue {
+    fn drop(&mut self) {
+        self.flush();
+    }
+}
+
 pub struct VulkanEngine {
-    app: AppState,
-    sdl: SdlContext,
-    vulkan_state: VulkanState,
-    swapchain_state: SwapchainState,
-    frames: FramesState,
     del_queue: DeletionQueue,
+    frames: FramesState,
+    swapchain_state: SwapchainState,
+    vma_state: VmaState,
+    vulkan_state: VulkanState,
+    sdl: SdlContext,
+    app: AppState,
 }
 
 impl VulkanEngine {
@@ -423,15 +437,25 @@ impl VulkanEngine {
         let sdl = SdlContext::new()?;
         let window_hnd = sdl.window.window_handle().map_err(anyhow::Error::msg)?;
         let display_hnd = sdl.window.display_handle().map_err(anyhow::Error::msg)?;
-        let vulkan = VulkanState::new(window_hnd, display_hnd)?;
-        let swapchain = SwapchainState::new(&vulkan, size)?;
-        let frames = FramesState::new(&vulkan)?;
+        let vulkan_state = VulkanState::new(window_hnd, display_hnd)?;
+        let vma_state = VmaState::new(&vulkan_state.instance, &vulkan_state.device)?;
+        let swapchain_state = SwapchainState::new(
+            vulkan_state.instance.clone(),
+            vulkan_state.device.clone(),
+            vma_state.alloc.clone(),
+            size,
+        )?;
+        let frames = FramesState::new(
+            vulkan_state.device.clone(),
+            vulkan_state.graphics_queue_index,
+        )?;
         let del_queue = DeletionQueue::new();
         Ok(Self {
             app,
             sdl,
-            vulkan_state: vulkan,
-            swapchain_state: swapchain,
+            vulkan_state,
+            vma_state,
+            swapchain_state,
             frames,
             del_queue,
         })
@@ -639,21 +663,12 @@ impl VulkanEngine {
         }
         Ok(())
     }
-
-    fn destroy(&mut self) {
-        unsafe {
-            self.vulkan_state.device.device_wait_idle().unwrap();
-        }
-
-        self.del_queue.flush();
-        self.frames.destroy(&self.vulkan_state);
-        self.swapchain_state.destroy(&self.vulkan_state);
-        self.vulkan_state.destroy();
-    }
 }
 
 impl Drop for VulkanEngine {
     fn drop(&mut self) {
-        self.destroy();
+        unsafe {
+            self.vulkan_state.device.device_wait_idle().unwrap();
+        }
     }
 }
