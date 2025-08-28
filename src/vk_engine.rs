@@ -1,6 +1,8 @@
 use std::collections::VecDeque;
+use std::ffi::CString;
 use std::fmt::{Debug, Formatter};
 use std::ops::{Deref, DerefMut};
+use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 use std::{slice, thread};
@@ -14,8 +16,10 @@ use sdl3::{Sdl, VideoSubsystem as SdlVideo};
 use vk_mem::Alloc;
 use {ash_bootstrap as vkb, vk_mem as vma};
 
-use crate::vk_types::AllocatedImage;
-use crate::{vk_image as vkimg, vk_initializers as vkinit};
+use crate::vk_types::{
+    AllocatedImage, DescriptorAllocator, DescriptorLayoutBuilder, PoolSizeRatio,
+};
+use crate::{vk_image as vkimg, vk_initializers as vkinit, vk_pipelines as vkpipe};
 
 const NANOS_IN_SECOND: u64 = 1_000_000_000;
 
@@ -111,7 +115,7 @@ struct FrameData {
     main_command_buffer: vk::CommandBuffer,
     image_acquried_semaphore: vk::Semaphore,
     frame_fence: vk::Fence,
-    del_queue: DeletionQueue,
+    del_queue: DeletionQueue<'static>,
 }
 
 struct FramesState {
@@ -180,8 +184,8 @@ impl Drop for FramesState {
                 self.device.destroy_fence(frame.frame_fence, None);
                 self.device
                     .destroy_semaphore(frame.image_acquried_semaphore, None);
-                frame.del_queue.flush();
             }
+            frame.del_queue.flush();
         }
     }
 }
@@ -382,11 +386,11 @@ impl SdlContext {
     }
 }
 
-struct DeletionQueue {
-    deletors: VecDeque<Box<dyn FnOnce()>>,
+struct DeletionQueue<'a> {
+    deletors: VecDeque<Box<dyn FnOnce() + 'a>>,
 }
 
-impl Debug for DeletionQueue {
+impl Debug for DeletionQueue<'_> {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         writeln!(
             f,
@@ -396,13 +400,13 @@ impl Debug for DeletionQueue {
     }
 }
 
-impl DeletionQueue {
+impl<'a> DeletionQueue<'a> {
     fn new() -> Self {
         Self {
             deletors: VecDeque::new(),
         }
     }
-    fn push<F: FnOnce() + 'static>(&mut self, f: F) {
+    fn push<F: FnOnce() + 'a>(&mut self, f: F) {
         self.deletors.push_back(Box::new(f));
     }
     fn flush(&mut self) {
@@ -412,14 +416,155 @@ impl DeletionQueue {
     }
 }
 
-impl Drop for DeletionQueue {
+impl Drop for DeletionQueue<'_> {
     fn drop(&mut self) {
         self.flush();
     }
 }
 
+struct DescriptorsState {
+    draw_image_descriptors: vk::DescriptorSet,
+    draw_image_descriptor_layout: vk::DescriptorSetLayout,
+    global_descriptor_alloc: DescriptorAllocator,
+    device: Arc<vkb::Device>,
+}
+
+impl DescriptorsState {
+    fn new(
+        device: Arc<vkb::Device>,
+        draw_image_view: vk::ImageView,
+    ) -> Result<Self, anyhow::Error> {
+        let sizes = vec![PoolSizeRatio {
+            ty: vk::DescriptorType::STORAGE_IMAGE,
+            ratio: 1.0,
+        }];
+
+        let global_descriptor_alloc = DescriptorAllocator::new(device.clone(), 10, &sizes)?;
+
+        let mut builder = DescriptorLayoutBuilder::new(device.clone());
+        builder.add_binding(0, vk::DescriptorType::STORAGE_IMAGE);
+        let draw_image_descriptor_layout = builder.build(
+            vk::ShaderStageFlags::COMPUTE,
+            None::<&mut vk::DescriptorSetLayoutBindingFlagsCreateInfo>, // what?
+            None,
+        )?;
+
+        let draw_image_descriptors =
+            global_descriptor_alloc.allocate(&draw_image_descriptor_layout)?;
+
+        let img_info = vk::DescriptorImageInfo::default()
+            .image_layout(vk::ImageLayout::GENERAL)
+            .image_view(draw_image_view);
+
+        let draw_image_write = vk::WriteDescriptorSet::default()
+            .dst_binding(0)
+            .dst_set(draw_image_descriptors)
+            .descriptor_count(1)
+            .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
+            .image_info(slice::from_ref(&img_info));
+
+        unsafe { device.update_descriptor_sets(slice::from_ref(&draw_image_write), &[]) };
+
+        Ok(Self {
+            device,
+            global_descriptor_alloc,
+            draw_image_descriptor_layout,
+            draw_image_descriptors,
+        })
+    }
+}
+
+impl Drop for DescriptorsState {
+    fn drop(&mut self) {
+        unsafe {
+            self.device
+                .destroy_descriptor_set_layout(self.draw_image_descriptor_layout, None)
+        };
+    }
+}
+
+struct PipelinesState {
+    background: BackgroundPipelinesState,
+}
+
+impl PipelinesState {
+    fn new(
+        device: Arc<vkb::Device>,
+        draw_image_descriptor_layout: &vk::DescriptorSetLayout,
+    ) -> anyhow::Result<Self> {
+        let background = BackgroundPipelinesState::new(device, draw_image_descriptor_layout)?;
+        Ok(Self { background })
+    }
+}
+
+struct BackgroundPipelinesState {
+    gradient_pipeline: vk::Pipeline,
+    gradient_pipeline_layout: vk::PipelineLayout,
+    device: Arc<vkb::Device>,
+}
+
+impl BackgroundPipelinesState {
+    fn new(
+        device: Arc<vkb::Device>,
+        draw_image_descriptor_layout: &vk::DescriptorSetLayout,
+    ) -> anyhow::Result<Self> {
+        let compute_layout = vk::PipelineLayoutCreateInfo::default()
+            .set_layouts(slice::from_ref(draw_image_descriptor_layout));
+
+        let gradient_pipeline_layout =
+            unsafe { device.create_pipeline_layout(&compute_layout, None)? };
+
+        let compute_draw_shader =
+            vkpipe::load_shader_module(&device, "shaders/out/gradient.comp.spv")?;
+
+        let name = CString::from_str("main")?;
+        let stage_info = vk::PipelineShaderStageCreateInfo::default()
+            .stage(vk::ShaderStageFlags::COMPUTE)
+            .module(compute_draw_shader)
+            .name(name.as_c_str());
+
+        let compute_pipeline_create_info = vk::ComputePipelineCreateInfo::default()
+            .layout(gradient_pipeline_layout)
+            .stage(stage_info);
+
+        let gradient_pipeline = unsafe {
+            device
+                .create_compute_pipelines(
+                    vk::PipelineCache::null(),
+                    slice::from_ref(&compute_pipeline_create_info),
+                    None,
+                )
+                .map_err(|(_, e)| e)?
+                .into_iter()
+                .next()
+                .unwrap()
+        };
+
+        unsafe { device.destroy_shader_module(compute_draw_shader, None) };
+
+        Ok(Self {
+            gradient_pipeline_layout,
+            gradient_pipeline,
+            device,
+        })
+    }
+}
+
+impl Drop for BackgroundPipelinesState {
+    fn drop(&mut self) {
+        unsafe { self.device.destroy_pipeline(self.gradient_pipeline, None) };
+        unsafe {
+            self.device
+                .destroy_pipeline_layout(self.gradient_pipeline_layout, None)
+        };
+    }
+}
+
 pub struct VulkanEngine {
-    del_queue: DeletionQueue,
+    del_queue: DeletionQueue<'static>,
+
+    pipelines_state: PipelinesState,
+    desc_state: DescriptorsState,
     frames: FramesState,
     swapchain_state: SwapchainState,
     vma_state: VmaState,
@@ -435,21 +580,30 @@ impl VulkanEngine {
             height: 1080,
         };
         let app = AppState::new()?;
+
         let sdl = SdlContext::new()?;
         let window_hnd = sdl.window.window_handle().map_err(anyhow::Error::msg)?;
         let display_hnd = sdl.window.display_handle().map_err(anyhow::Error::msg)?;
+
         let vulkan_state = VulkanState::new(window_hnd, display_hnd)?;
-        let vma_state = VmaState::new(&vulkan_state.instance, &vulkan_state.device)?;
-        let swapchain_state = SwapchainState::new(
-            vulkan_state.instance.clone(),
-            vulkan_state.device.clone(),
-            vma_state.alloc.clone(),
-            size,
-        )?;
-        let frames = FramesState::new(
-            vulkan_state.device.clone(),
-            vulkan_state.graphics_queue_index,
-        )?;
+        let instance = &vulkan_state.instance;
+        let device = &vulkan_state.device;
+        let graphics_queue_index = vulkan_state.graphics_queue_index;
+
+        let vma_state = VmaState::new(&instance, &device)?;
+        let alloc = &vma_state.alloc;
+
+        let swapchain_state =
+            SwapchainState::new(instance.clone(), device.clone(), alloc.clone(), size)?;
+        let draw_image_view = swapchain_state.draw_image.image_view;
+
+        let frames = FramesState::new(device.clone(), graphics_queue_index)?;
+
+        let desc_state = DescriptorsState::new(device.clone(), draw_image_view)?;
+        let draw_image_desc_layout = desc_state.draw_image_descriptor_layout;
+
+        let pipelines_state = PipelinesState::new(device.clone(), &draw_image_desc_layout)?;
+
         let del_queue = DeletionQueue::new();
         Ok(Self {
             app,
@@ -458,6 +612,8 @@ impl VulkanEngine {
             vma_state,
             swapchain_state,
             frames,
+            desc_state,
+            pipelines_state,
             del_queue,
         })
     }
@@ -502,6 +658,15 @@ impl VulkanEngine {
         self.app.frame_number % FRAME_OVERLAP
     }
 
+    fn current_frame(&self) -> &FrameData {
+        &self.frames[self.current_frame_index()]
+    }
+
+    fn current_frame_mut(&mut self) -> &mut FrameData {
+        let index = self.current_frame_index();
+        &mut self.frames[index]
+    }
+
     /// returns VulkanDevice
     fn vk_device(&self) -> &vkb::Device {
         self.vulkan_state.device.deref()
@@ -518,8 +683,7 @@ impl VulkanEngine {
     }
 
     fn draw(&mut self) -> Result<(), anyhow::Error> {
-        let frame_index = self.current_frame_index();
-        let frame = &self.frames[frame_index];
+        let frame = self.current_frame();
         let frame_fence = frame.frame_fence;
         let image_acquired_semaphore = frame.image_acquried_semaphore;
         let cmd = frame.main_command_buffer;
@@ -533,7 +697,7 @@ impl VulkanEngine {
             )?
         };
 
-        self.frames[frame_index].del_queue.flush();
+        self.current_frame_mut().del_queue.flush();
 
         unsafe {
             self.vk_device()
@@ -648,20 +812,47 @@ impl VulkanEngine {
     }
 
     fn draw_background(&mut self, cmd: vk::CommandBuffer) -> Result<(), anyhow::Error> {
-        let flash = (self.app.frame_number as f32 / 120.0).sin().abs();
-        let clear_value = vk::ClearColorValue {
-            float32: [0.0, 0.0, flash, 1.0],
-        };
-        let clear_range = vkinit::image_subresource_range(vk::ImageAspectFlags::COLOR);
+        // let flash = (self.app.frame_number as f32 / 120.0).sin().abs();
+        // let clear_value = vk::ClearColorValue {
+        //     float32: [0.0, 0.0, flash, 1.0],
+        // };
+        // let clear_range = vkinit::image_subresource_range(vk::ImageAspectFlags::COLOR);
+        // unsafe {
+        //     self.vk_device().cmd_clear_color_image(
+        //         cmd,
+        //         self.swapchain_state.draw_image.image,
+        //         vk::ImageLayout::GENERAL,
+        //         &clear_value,
+        //         slice::from_ref(&clear_range),
+        //     );
+        // }
+
+        let pipeline = self.pipelines_state.background.gradient_pipeline;
         unsafe {
-            self.vk_device().cmd_clear_color_image(
+            self.vk_device()
+                .cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipeline);
+        };
+
+        let layout = self.pipelines_state.background.gradient_pipeline_layout;
+        let desc_sets = self.desc_state.draw_image_descriptors;
+        unsafe {
+            self.vk_device().cmd_bind_descriptor_sets(
                 cmd,
-                self.swapchain_state.draw_image.image,
-                vk::ImageLayout::GENERAL,
-                &clear_value,
-                slice::from_ref(&clear_range),
+                vk::PipelineBindPoint::COMPUTE,
+                layout,
+                0,
+                slice::from_ref(&desc_sets),
+                &[],
             );
         }
+
+        let extent = self.swapchain_state.draw_image.image_extent;
+        let disp_x = extent.width.div_ceil(16);
+        let disp_y = extent.height.div_ceil(16);
+        unsafe {
+            self.vk_device().cmd_dispatch(cmd, disp_x, disp_y, 1);
+        }
+
         Ok(())
     }
 }
