@@ -552,11 +552,11 @@ impl BackgroundPipelinesState {
 
 impl Drop for BackgroundPipelinesState {
     fn drop(&mut self) {
-        unsafe { self.device.destroy_pipeline(self.gradient_pipeline, None) };
         unsafe {
+            self.device.destroy_pipeline(self.gradient_pipeline, None);
             self.device
-                .destroy_pipeline_layout(self.gradient_pipeline_layout, None)
-        };
+                .destroy_pipeline_layout(self.gradient_pipeline_layout, None);
+        }
     }
 }
 
